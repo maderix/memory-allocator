@@ -1,221 +1,195 @@
+#include "memory_allocator.h"  // your FancyPerThreadAllocator
 #include <iostream>
 #include <thread>
 #include <vector>
 #include <random>
 #include <chrono>
 #include <cstdlib>
-#include "memory_allocator.h" // Contains ThreadsafeBasicAllocator + ThreadsafeCoalescingAllocator
+#include <mutex>
 
-// -----------------------------------------------
-// 1) Multi-thread test for Basic Alloc
-// -----------------------------------------------
-void workerBasic(ThreadsafeBasicAllocator* alloc, int numOps) {
-    std::vector<void*> localPtrs;
-    localPtrs.reserve(numOps / 2);
+// A simple interface to unify "FancyPerThreadAllocator" and "SystemAlloc"
+class AllocInterface {
+public:
+    virtual ~AllocInterface() {}
+    virtual void* allocate(size_t size) = 0;
+    virtual void deallocate(void* ptr) = 0;
+    // For stats if available, system alloc won't have stats
+    virtual bool hasStats() const { return false; }
+    virtual AllocStatsSnapshot getStatsSnapshot() const { return AllocStatsSnapshot{0,0,0,0}; }
+};
 
-    std::default_random_engine rng(std::random_device{}());
-    std::uniform_int_distribution<int> sizeDist(1, 256);  // random block sizes
-    std::uniform_int_distribution<int> opDist(0, 99);
+////////////////////////////////////////////////////////
+// 1) Implementation for FancyPerThreadAllocator
+////////////////////////////////////////////////////////
+class FancyAllocWrapper : public AllocInterface {
+public:
+    FancyAllocWrapper(size_t arenaSize)
+        : fpa_(arenaSize)
+    {}
 
-    for(int i = 0; i < numOps; i++){
-        int op = opDist(rng);
-        if(op < 50) {
-            // ~50% allocate
-            size_t sz = sizeDist(rng);
-            void* p   = alloc->allocate(sz);
-            if(p) {
-                localPtrs.push_back(p);
-            }
-        } else {
-            // ~50% free
-            if(!localPtrs.empty()) {
-                int idx = rng() % localPtrs.size();
-                void* p = localPtrs[idx];
-                localPtrs[idx] = localPtrs.back();
-                localPtrs.pop_back();
-                alloc->deallocate(p);
-            }
-        }
+    void* allocate(size_t size) override {
+        return fpa_.allocate(size);
     }
-    // final free
-    for(void* p : localPtrs) {
-        alloc->deallocate(p);
+    void deallocate(void* ptr) override {
+        fpa_.deallocate(ptr);
     }
-}
+    bool hasStats() const override { return true; }
+    AllocStatsSnapshot getStatsSnapshot() const override {
+        return fpa_.getStatsSnapshot();
+    }
 
-void threadedTestBasicAllocator() {
-    std::cout << "\n=== Threaded Test: Basic Allocator ===\n";
-    const int NUM_THREADS    = 4;
-    const int OPS_PER_THREAD = 50000;
+private:
+    FancyPerThreadAllocator fpa_;
+};
 
-    ThreadsafeBasicAllocator alloc(2 * 1024 * 1024); // 2MB
+////////////////////////////////////////////////////////
+// 2) Implementation for system malloc/free
+////////////////////////////////////////////////////////
+class SystemAllocWrapper : public AllocInterface {
+public:
+    void* allocate(size_t size) override {
+        return std::malloc(size);
+    }
+    void deallocate(void* ptr) override {
+        std::free(ptr);
+    }
+    // has no stats
+};
+
+////////////////////////////////////////////////////////
+// Global pointer pool for the concurrency test
+////////////////////////////////////////////////////////
+static constexpr size_t GLOBAL_CAPACITY = 100000;
+static std::vector<void*> g_ptrs(GLOBAL_CAPACITY, nullptr);
+static std::mutex g_ptrsMutex;
+
+////////////////////////////////////////////////////////
+// The concurrency test function
+////////////////////////////////////////////////////////
+struct TestResult {
+    long long elapsedMicroseconds;
+    // If the alloc has stats
+    size_t totalAllocCalls;
+    size_t totalFreeCalls;
+    size_t peakUsage;
+};
+
+TestResult runHighConcurrencyTest(AllocInterface* alloc, int numThreads, int opsPerThread) {
+    // reset global pointer array
+    {
+        std::lock_guard<std::mutex> lk(g_ptrsMutex);
+        std::fill(g_ptrs.begin(), g_ptrs.end(), nullptr);
+    }
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    std::vector<std::thread> threads;
-    threads.reserve(NUM_THREADS);
-    for(int i=0; i<NUM_THREADS; i++){
-        threads.emplace_back(workerBasic, &alloc, OPS_PER_THREAD);
+    // spawn threads
+    std::vector<std::thread> ths;
+    ths.reserve(numThreads);
+
+    for (int i=0; i<numThreads; i++) {
+        ths.emplace_back([=](AllocInterface* a) {
+            std::default_random_engine rng(std::random_device{}());
+            std::uniform_int_distribution<int> sizeDist(1, 4096);
+            std::uniform_int_distribution<int> opDist(0,99);
+            std::uniform_int_distribution<size_t> idxDist(0, GLOBAL_CAPACITY - 1);
+
+            for(int c=0; c<opsPerThread; c++){
+                int op = opDist(rng);
+                if (op<60) {
+                    // 60% allocate
+                    size_t sz = sizeDist(rng);
+                    // pick slot
+                    std::lock_guard<std::mutex> gl(g_ptrsMutex);
+                    size_t idx = idxDist(rng);
+                    if(!g_ptrs[idx]) {
+                        void* p = a->allocate(sz);
+                        g_ptrs[idx]=p;
+                    }
+                } else {
+                    // 40% free
+                    std::lock_guard<std::mutex> gl(g_ptrsMutex);
+                    size_t idx = idxDist(rng);
+                    if(g_ptrs[idx]) {
+                        void* p = g_ptrs[idx];
+                        g_ptrs[idx] = nullptr;
+                        a->deallocate(p);
+                    }
+                }
+            }
+        }, alloc);
     }
-    for(auto& t : threads){
+
+    for (auto& t: ths) {
         t.join();
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-    std::cout << "threadedTestBasicAllocator done.\n";
-    std::cout << "Elapsed time: " << dur_us << " microseconds\n";
-
-    // Show final stats
-    auto stats = alloc.getStats();
-    std::cout << "Alloc calls: "   << stats.totalAllocCalls
-              << ", Dealloc calls: " << stats.totalDeallocCalls
-              << ", Peak usage: "    << stats.peakUsedBytes << " bytes\n";
-}
-
-// -----------------------------------------------
-// 2) Multi-thread test for Coalescing Alloc
-// -----------------------------------------------
-void workerCoalescing(ThreadsafeCoalescingAllocator* alloc, int numOps) {
-    std::vector<void*> localPtrs;
-    localPtrs.reserve(numOps / 2);
-
-    std::default_random_engine rng(std::random_device{}());
-    std::uniform_int_distribution<int> sizeDist(1, 512);
-    std::uniform_int_distribution<int> opDist(0, 99);
-
-    for(int i=0; i<numOps; i++){
-        int op = opDist(rng);
-        if(op < 60) {
-            // ~60% allocate
-            size_t sz = sizeDist(rng);
-            void* p   = alloc->allocate(sz);
-            if(p) {
-                localPtrs.push_back(p);
-            }
-        } else {
-            // ~40% free
-            if(!localPtrs.empty()) {
-                int idx = rng() % localPtrs.size();
-                void* p = localPtrs[idx];
-                localPtrs[idx] = localPtrs.back();
-                localPtrs.pop_back();
-                alloc->deallocate(p);
+    // final cleanup
+    {
+        std::lock_guard<std::mutex> lk(g_ptrsMutex);
+        for (auto& ptr : g_ptrs) {
+            if (ptr) {
+                alloc->deallocate(ptr);
+                ptr=nullptr;
             }
         }
     }
-    // final free
-    for(void* p : localPtrs) {
-        alloc->deallocate(p);
-    }
-}
-
-void threadedTestCoalescingAllocator() {
-    std::cout << "\n=== Threaded Test: Coalescing Allocator ===\n";
-    const int NUM_THREADS    = 4;
-    const int OPS_PER_THREAD = 80000;
-
-    ThreadsafeCoalescingAllocator alloc(4 * 1024 * 1024); // 4MB
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    std::vector<std::thread> threads;
-    threads.reserve(NUM_THREADS);
-    for(int i=0; i<NUM_THREADS; i++){
-        threads.emplace_back(workerCoalescing, &alloc, OPS_PER_THREAD);
-    }
-    for(auto& t : threads){
-        t.join();
-    }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    auto us  = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-    std::cout << "threadedTestCoalescingAllocator done.\n";
-    std::cout << "Elapsed time: " << dur_us << " microseconds\n";
+    TestResult result;
+    result.elapsedMicroseconds = us;
 
-    // final stats
-    auto stats = alloc.getStats();
-    std::cout << "Alloc calls: "   << stats.totalAllocCalls
-              << ", Dealloc calls: " << stats.totalDeallocCalls
-              << ", Peak usage: "    << stats.peakUsedBytes << " bytes\n";
+    if (alloc->hasStats()) {
+        auto snap = alloc->getStatsSnapshot();
+        result.totalAllocCalls = snap.totalAllocCalls;
+        result.totalFreeCalls  = snap.totalFreeCalls;
+        result.peakUsage       = snap.peakUsedBytes;
+    } else {
+        result.totalAllocCalls = 0;
+        result.totalFreeCalls  = 0;
+        result.peakUsage       = 0;
+    }
+
+    return result;
 }
 
-// -----------------------------------------------
-// 3) Multi-thread test for system malloc/free
-// -----------------------------------------------
-void workerMalloc(int numOps) {
-    std::vector<void*> localPtrs;
-    localPtrs.reserve(numOps / 2);
-
-    std::default_random_engine rng(std::random_device{}());
-    std::uniform_int_distribution<int> sizeDist(1, 512);
-    std::uniform_int_distribution<int> opDist(0, 99);
-
-    for(int i=0; i<numOps; i++){
-        int op = opDist(rng);
-        if(op < 60) {
-            // ~60% allocate
-            size_t sz = sizeDist(rng);
-            void* p   = std::malloc(sz);
-            if(p) {
-                localPtrs.push_back(p);
-            }
-        } else {
-            // ~40% free
-            if(!localPtrs.empty()) {
-                int idx = rng() % localPtrs.size();
-                void* p = localPtrs[idx];
-                localPtrs[idx] = localPtrs.back();
-                localPtrs.pop_back();
-                std::free(p);
-            }
-        }
-    }
-    // final free
-    for(void* p : localPtrs) {
-        std::free(p);
-    }
-}
-
-void threadedTestMalloc() {
-    std::cout << "\n=== Threaded Test: System malloc/free ===\n";
-    const int NUM_THREADS    = 4;
-    const int OPS_PER_THREAD = 60000;
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    std::vector<std::thread> threads;
-    threads.reserve(NUM_THREADS);
-    for(int i=0; i<NUM_THREADS; i++){
-        threads.emplace_back(workerMalloc, OPS_PER_THREAD);
-    }
-    for(auto& t : threads){
-        t.join();
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-    std::cout << "threadedTestMalloc done.\n";
-    std::cout << "Elapsed time: " << dur_us << " microseconds\n";
-}
-
-// -----------------------------------------------
-// Main
-// -----------------------------------------------
+////////////////////////////////////////////////////////
+// main
+////////////////////////////////////////////////////////
 int main() {
-    std::srand(static_cast<unsigned>(time(nullptr)));
+    std::cout << "=== Detailed High Concurrency Comparison ===\n";
 
-    // 1) Basic Alloc
-    threadedTestBasicAllocator();
+    // We define the test parameters
+    const int THREADS=64;
+    const int OPS=1000000; // 1 million ops per thread (64 million total)
 
-    // 2) Coalescing Alloc
-    threadedTestCoalescingAllocator();
+    // 1) Fancy
+    {
+        FancyAllocWrapper fancy(64 * 1024 * 1024); // 64MB arena
+        TestResult r = runHighConcurrencyTest(&fancy, THREADS, OPS);
+        std::cout << "\n-- FancyPerThreadAllocator --\n";
+        std::cout << "Threads     : " << THREADS << "\n";
+        std::cout << "Ops/Thread  : " << OPS << "\n";
+        std::cout << "Elapsed (us): " << r.elapsedMicroseconds << "\n";
+        std::cout << "Alloc calls : " << r.totalAllocCalls << "\n";
+        std::cout << "Free calls  : " << r.totalFreeCalls << "\n";
+        std::cout << "Peak usage  : " << r.peakUsage << " bytes\n";
+    }
 
-    // 3) System Malloc
-    threadedTestMalloc();
+    // 2) System
+    {
+        SystemAllocWrapper sysAlloc;
+        TestResult r = runHighConcurrencyTest(&sysAlloc, THREADS, OPS);
+        std::cout << "\n-- System malloc/free --\n";
+        std::cout << "Threads     : " << THREADS << "\n";
+        std::cout << "Ops/Thread  : " << OPS << "\n";
+        std::cout << "Elapsed (us): " << r.elapsedMicroseconds << "\n";
+        std::cout << "Alloc calls : " << r.totalAllocCalls << "\n"; // always 0 for system
+        std::cout << "Free calls  : " << r.totalFreeCalls << "\n";  // always 0
+        std::cout << "Peak usage  : " << r.peakUsage << " bytes\n"; // always 0
+    }
 
     std::cout << "\nAll tests completed.\n";
     return 0;
