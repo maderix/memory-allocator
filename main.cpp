@@ -1,194 +1,169 @@
-#include "memory_allocator.h"  // your FancyPerThreadAllocator
+#include "memory_allocator.h"  // your final memory_allocator.h with optional reclamation
 #include <iostream>
 #include <thread>
 #include <vector>
 #include <random>
 #include <chrono>
 #include <cstdlib>
-#include <mutex>
 
-// A simple interface to unify "FancyPerThreadAllocator" and "SystemAlloc"
+
+// We'll define an interface for system vs fancy
 class AllocInterface {
 public:
     virtual ~AllocInterface() {}
-    virtual void* allocate(size_t size) = 0;
-    virtual void deallocate(void* ptr) = 0;
-    // For stats if available, system alloc won't have stats
+    virtual void* allocate(size_t sz)=0;
+    virtual void  deallocate(void* ptr)=0;
     virtual bool hasStats() const { return false; }
-    virtual AllocStatsSnapshot getStatsSnapshot() const { return AllocStatsSnapshot{0,0,0,0}; }
+    virtual AllocStatsSnapshot getStats() const { return {0,0,0,0}; }
 };
 
-////////////////////////////////////////////////////////
-// 1) Implementation for FancyPerThreadAllocator
-////////////////////////////////////////////////////////
-class FancyAllocWrapper : public AllocInterface {
+// A wrapper for FancyPerThreadAllocator
+class FancyInterface : public AllocInterface {
 public:
-    FancyAllocWrapper(size_t arenaSize)
-        : fpa_(arenaSize)
+    FancyInterface(size_t arenaSize, bool reclamation)
+        : fancy_(arenaSize, reclamation)
     {}
-
-    void* allocate(size_t size) override {
-        return fpa_.allocate(size);
+    void* allocate(size_t sz) override {
+        return fancy_.allocate(sz);
     }
     void deallocate(void* ptr) override {
-        fpa_.deallocate(ptr);
+        fancy_.deallocate(ptr);
     }
     bool hasStats() const override { return true; }
-    AllocStatsSnapshot getStatsSnapshot() const override {
-        return fpa_.getStatsSnapshot();
+    AllocStatsSnapshot getStats() const override {
+        return fancy_.getStatsSnapshot();
     }
-
 private:
-    FancyPerThreadAllocator fpa_;
+    FancyPerThreadAllocator fancy_;
 };
 
-////////////////////////////////////////////////////////
-// 2) Implementation for system malloc/free
-////////////////////////////////////////////////////////
-class SystemAllocWrapper : public AllocInterface {
+// A wrapper for system malloc
+class SystemInterface : public AllocInterface {
 public:
-    void* allocate(size_t size) override {
-        return std::malloc(size);
-    }
-    void deallocate(void* ptr) override {
-        std::free(ptr);
-    }
-    // has no stats
+    void* allocate(size_t sz) override { return std::malloc(sz); }
+    void  deallocate(void* ptr) override { std::free(ptr); }
 };
 
-////////////////////////////////////////////////////////
-// Global pointer pool for the concurrency test
-////////////////////////////////////////////////////////
-static constexpr size_t GLOBAL_CAPACITY = 100000;
-static std::vector<void*> g_ptrs(GLOBAL_CAPACITY, nullptr);
-static std::mutex g_ptrsMutex;
+// We'll do an ephemeral HPC scenario with ring buffer 
+void ephemeralWorker(AllocInterface* alloc, int ops, int ringSize)
+{
+    struct Slot { void* ptr; int ttl; };
+    std::vector<Slot> ring(ringSize, {nullptr, 0});
+    int pos=0;
 
-////////////////////////////////////////////////////////
-// The concurrency test function
-////////////////////////////////////////////////////////
-struct TestResult {
-    long long elapsedMicroseconds;
-    // If the alloc has stats
-    size_t totalAllocCalls;
-    size_t totalFreeCalls;
-    size_t peakUsage;
-};
+    std::default_random_engine rng(std::random_device{}());
+    std::uniform_int_distribution<int> catDist(1,100);
+    std::uniform_int_distribution<int> smallDist(16,256);
+    std::uniform_int_distribution<int> medDist(512,2048);
+    std::uniform_int_distribution<int> largeDist(4096,32768);
+    std::uniform_int_distribution<int> ttlDist(50,2000);
 
-TestResult runHighConcurrencyTest(AllocInterface* alloc, int numThreads, int opsPerThread) {
-    // reset global pointer array
-    {
-        std::lock_guard<std::mutex> lk(g_ptrsMutex);
-        std::fill(g_ptrs.begin(), g_ptrs.end(), nullptr);
-    }
+    for(int i=0; i<ops; i++){
+        auto& slot = ring[pos];
+        // free if expired
+        if(slot.ptr && slot.ttl <= 0){
+            alloc->deallocate(slot.ptr);
+            slot.ptr = nullptr;
+        }
+        // decrement TTL
+        if(slot.ptr && slot.ttl>0){
+            slot.ttl--;
+        }
+        // if empty => allocate new
+        if(!slot.ptr){
+            int c = catDist(rng);
+            size_t sz=0;
+            if(c<=60) sz=smallDist(rng);
+            else if(c<=90) sz=medDist(rng);
+            else sz=largeDist(rng);
 
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // spawn threads
-    std::vector<std::thread> ths;
-    ths.reserve(numThreads);
-
-    for (int i=0; i<numThreads; i++) {
-        ths.emplace_back([=](AllocInterface* a) {
-            std::default_random_engine rng(std::random_device{}());
-            std::uniform_int_distribution<int> sizeDist(1, 4096);
-            std::uniform_int_distribution<int> opDist(0,99);
-            std::uniform_int_distribution<size_t> idxDist(0, GLOBAL_CAPACITY - 1);
-
-            for(int c=0; c<opsPerThread; c++){
-                int op = opDist(rng);
-                if (op<60) {
-                    // 60% allocate
-                    size_t sz = sizeDist(rng);
-                    // pick slot
-                    std::lock_guard<std::mutex> gl(g_ptrsMutex);
-                    size_t idx = idxDist(rng);
-                    if(!g_ptrs[idx]) {
-                        void* p = a->allocate(sz);
-                        g_ptrs[idx]=p;
-                    }
-                } else {
-                    // 40% free
-                    std::lock_guard<std::mutex> gl(g_ptrsMutex);
-                    size_t idx = idxDist(rng);
-                    if(g_ptrs[idx]) {
-                        void* p = g_ptrs[idx];
-                        g_ptrs[idx] = nullptr;
-                        a->deallocate(p);
-                    }
-                }
-            }
-        }, alloc);
-    }
-
-    for (auto& t: ths) {
-        t.join();
-    }
-
-    // final cleanup
-    {
-        std::lock_guard<std::mutex> lk(g_ptrsMutex);
-        for (auto& ptr : g_ptrs) {
-            if (ptr) {
-                alloc->deallocate(ptr);
-                ptr=nullptr;
+            void* p = alloc->allocate(sz);
+            if(p){
+                slot.ptr = p;
+                slot.ttl = ttlDist(rng);
             }
         }
+        pos = (pos+1) % ringSize;
     }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto us  = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-    TestResult result;
-    result.elapsedMicroseconds = us;
-
-    if (alloc->hasStats()) {
-        auto snap = alloc->getStatsSnapshot();
-        result.totalAllocCalls = snap.totalAllocCalls;
-        result.totalFreeCalls  = snap.totalFreeCalls;
-        result.peakUsage       = snap.peakUsedBytes;
-    } else {
-        result.totalAllocCalls = 0;
-        result.totalFreeCalls  = 0;
-        result.peakUsage       = 0;
+    // final free
+    for(auto& s : ring){
+        if(s.ptr){
+            alloc->deallocate(s.ptr);
+            s.ptr=nullptr;
+        }
     }
-
-    return result;
 }
 
-////////////////////////////////////////////////////////
-// main
-////////////////////////////////////////////////////////
-int main() {
-    std::cout << "=== Detailed High Concurrency Comparison ===\n";
 
-    // We define the test parameters
-    const int THREADS=64;
-    const int OPS=1000000; // 1 million ops per thread (64 million total)
 
-    // 1) Fancy
+// We'll do a timed test for ephemeral HPC scenario
+struct TestResult {
+    long long elapsedUs;
+    AllocStatsSnapshot snap;
+};
+
+TestResult runEphemeralTest(AllocInterface* alloc, int threads, int opsPerThread, int ringSize)
+{
+    auto start=std::chrono::high_resolution_clock::now();
+
+    std::vector<std::thread> ths;
+    ths.reserve(threads);
+    for(int i=0;i<threads;i++){
+        ths.emplace_back(ephemeralWorker, alloc, opsPerThread, ringSize);
+    }
+    for(auto& t : ths){
+        t.join();
+    }
+    auto end=std::chrono::high_resolution_clock::now();
+    long long us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    TestResult r;
+    r.elapsedUs= us;
+    if(alloc->hasStats()){
+        r.snap= alloc->getStats();
+    } else {
+        r.snap={0,0,0,0};
+    }
+    return r;
+}
+
+int main(){
+    // HPC ephemeral big test
+    int threads = 512;
+    int opsPerThread = 1000000;
+    int ringSize     = 500000;
+
+    std::cout << "\n=== Compare System Malloc vs. Fancy(Off) vs. Fancy(On) under HPC ephemeral scenario ===\n";
+    std::cout << "Threads= " << threads << ", Ops/Thread= " << opsPerThread << ", ringSize= " << ringSize << "\n";
+
+    // 1) System
     {
-        FancyAllocWrapper fancy(64 * 1024 * 1024); // 64MB arena
-        TestResult r = runHighConcurrencyTest(&fancy, THREADS, OPS);
-        std::cout << "\n-- FancyPerThreadAllocator --\n";
-        std::cout << "Threads     : " << THREADS << "\n";
-        std::cout << "Ops/Thread  : " << OPS << "\n";
-        std::cout << "Elapsed (us): " << r.elapsedMicroseconds << "\n";
-        std::cout << "Alloc calls : " << r.totalAllocCalls << "\n";
-        std::cout << "Free calls  : " << r.totalFreeCalls << "\n";
-        std::cout << "Peak usage  : " << r.peakUsage << " bytes\n";
+        SystemInterface sys;
+        auto r = runEphemeralTest(&sys, threads, opsPerThread, ringSize);
+        std::cout << "\n-- System malloc/free --\n";
+        std::cout << "Elapsed (us): " << r.elapsedUs << "\n";
     }
 
-    // 2) System
+    // 2) Fancy Reclamation OFF
     {
-        SystemAllocWrapper sysAlloc;
-        TestResult r = runHighConcurrencyTest(&sysAlloc, THREADS, OPS);
-        std::cout << "\n-- System malloc/free --\n";
-        std::cout << "Threads     : " << THREADS << "\n";
-        std::cout << "Ops/Thread  : " << OPS << "\n";
-        std::cout << "Elapsed (us): " << r.elapsedMicroseconds << "\n";
-        std::cout << "Alloc calls : " << r.totalAllocCalls << "\n"; // always 0 for system
-        std::cout << "Free calls  : " << r.totalFreeCalls << "\n";  // always 0
-        std::cout << "Peak usage  : " << r.peakUsage << " bytes\n"; // always 0
+        FancyInterface fancyNoReclaim(64ULL*1024ULL*1024ULL, false);
+        auto r = runEphemeralTest(&fancyNoReclaim, threads, opsPerThread, ringSize);
+        std::cout << "\n-- Fancy Per-Thread (Reclamation OFF) --\n";
+        std::cout << "Elapsed (us): " << r.elapsedUs << "\n";
+        std::cout << "Alloc calls : " << r.snap.totalAllocCalls 
+                  << ", Free calls: " << r.snap.totalFreeCalls 
+                  << ", Peak usage: " << r.snap.peakUsedBytes << "\n";
+    }
+
+    // 3) Fancy Reclamation ON
+    {
+        FancyInterface fancyReclaim(64ULL*1024ULL*1024ULL, true);
+        auto r = runEphemeralTest(&fancyReclaim, threads, opsPerThread, ringSize);
+        std::cout << "\n-- Fancy Per-Thread (Reclamation ON) --\n";
+        std::cout << "Elapsed (us): " << r.elapsedUs << "\n";
+        std::cout << "Alloc calls : " << r.snap.totalAllocCalls
+                  << ", Free calls: " << r.snap.totalFreeCalls
+                  << ", Peak usage: " << r.snap.peakUsedBytes << "\n";
     }
 
     std::cout << "\nAll tests completed.\n";

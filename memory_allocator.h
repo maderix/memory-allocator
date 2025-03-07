@@ -1,19 +1,21 @@
-#ifndef ARENA_ALLOCATOR_H
-#define ARENA_ALLOCATOR_H
+#ifndef MEMORY_ALLOCATOR_H
+#define MEMORY_ALLOCATOR_H
 
-#include <cstddef>   // size_t
-#include <cstdint>   // uint32_t
+#include <cstddef>     // size_t
+#include <cstdint>     // uint32_t
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include <memory>
-#include <cstring>   // for memset
-#include <algorithm> // for std::align
+#include <cstring>
+#include <algorithm>
+#include <condition_variable>
+#include <chrono>
 
-//---------------------------------------------------
-// 1. Stats
-//---------------------------------------------------
+//-------------------------------------------------------
+// 1) Stats
+//-------------------------------------------------------
 struct AllocStatsSnapshot {
     size_t totalAllocCalls;
     size_t totalFreeCalls;
@@ -28,130 +30,117 @@ struct AllocStats {
     std::atomic<size_t> peakUsedBytes{0};
 
     AllocStatsSnapshot snapshot() const {
-        AllocStatsSnapshot s;
-        s.totalAllocCalls  = totalAllocCalls.load();
-        s.totalFreeCalls   = totalFreeCalls.load();
-        s.currentUsedBytes = currentUsedBytes.load();
-        s.peakUsedBytes    = peakUsedBytes.load();
-        return s;
+        AllocStatsSnapshot snap;
+        snap.totalAllocCalls  = totalAllocCalls.load();
+        snap.totalFreeCalls   = totalFreeCalls.load();
+        snap.currentUsedBytes = currentUsedBytes.load();
+        snap.peakUsedBytes    = peakUsedBytes.load();
+        return snap;
     }
 };
 
-//---------------------------------------------------
-// 2. Thread-local small-block cache
-//    - multiple bins for 32,64,128,256
-//---------------------------------------------------
+//-------------------------------------------------------
+// 2) Thread-Local small-block cache
+//    With multiple bins for up to 256B
+//-------------------------------------------------------
 static constexpr int SMALL_BIN_COUNT = 4;
 static constexpr size_t SMALL_BIN_SIZE[SMALL_BIN_COUNT] = {32, 64, 128, 256};
 
-// We'll store a small metadata in the chunk itself:
-// [ binIndex (uint16_t) | userSize (uint16_t) | free-list pointer if freed ]
-// For demonstration, we'll store them as "size_t" for simplicity.
 struct SmallBlockHeader {
-    size_t binIndex;   // which bin
-    size_t userSize;   // actual requested size
-    // Then the user pointer is => (this header) + sizeof(SmallBlockHeader)
+    size_t binIndex;
+    size_t userSize;
 };
-
 struct SmallFreeBlock {
     SmallBlockHeader hdr;
     SmallFreeBlock* next;
 };
 
-// For each bin, we keep a singly linked list of free blocks
 class ThreadLocalSmallCache {
 public:
     ThreadLocalSmallCache() {
-        for (int i=0; i<SMALL_BIN_COUNT; i++) {
+        for (int i=0; i<SMALL_BIN_COUNT; i++){
             freeList_[i] = nullptr;
         }
     }
     ~ThreadLocalSmallCache() {}
 
-    // get bin index for a request
+    // find bin index for a requested size
     int findBin(size_t size) {
-        for (int i=0; i<SMALL_BIN_COUNT; i++) {
-            if (size <= SMALL_BIN_SIZE[i]) return i;
+        for(int i=0; i<SMALL_BIN_COUNT; i++){
+            if(size <= SMALL_BIN_SIZE[i]) return i;
         }
-        return -1; // not small
+        return -1; 
     }
 
-    // Provide a chunk if available
     void* allocateSmall(size_t reqSize, AllocStats& stats) {
-        int bin = findBin(reqSize);
-        if (bin < 0) return nullptr; // not small
-
-        // pop from free list if exist
+        int bin=findBin(reqSize);
+        if(bin<0) return nullptr; // not small
         auto*& head = freeList_[bin];
-        if (head) {
+        if(head){
+            // pop
             auto* blk = head;
             head = blk->next;
-            // fill the header info
-            blk->hdr.binIndex = bin;
+            // fill userSize
             blk->hdr.userSize = reqSize;
-            // user pointer => after header
+            // stats not updated here, but if you want every small
+            // chunk to be a 'system call' you could. We'll skip for performance
             return reinterpret_cast<char*>(blk) + sizeof(SmallBlockHeader);
         }
+        // no free => new chunk from system
+        size_t totalSz = sizeof(SmallBlockHeader)+SMALL_BIN_SIZE[bin];
+        char* block = (char*)::operator new(totalSz);
+        std::memset(block, 0, totalSz);
 
-        // no free chunk in this bin => allocate a fresh chunk from system or a new approach
-        // For demonstration, let's just create a new chunk from system
-        size_t chunkSize = SMALL_BIN_SIZE[bin];
-        // We store the header + user space
-        size_t totalSize = sizeof(SmallBlockHeader) + chunkSize;
-        char* block = (char*)::operator new(totalSize);
-        ::memset(block, 0, totalSize);
+        auto* freeB = reinterpret_cast<SmallFreeBlock*>(block);
+        freeB->hdr.binIndex= bin;
+        freeB->hdr.userSize= reqSize;
 
-        auto* sb = reinterpret_cast<SmallFreeBlock*>(block);
-        sb->hdr.binIndex = bin;
-        sb->hdr.userSize = reqSize;
-
-        stats.totalAllocCalls.fetch_add(1); // treat it as an "allocation" from system
-        stats.currentUsedBytes.fetch_add(totalSize);
+        // increment stats for the new chunk from system
+        stats.totalAllocCalls.fetch_add(1);
+        stats.currentUsedBytes.fetch_add(totalSz);
         auto c = stats.currentUsedBytes.load();
         auto p = stats.peakUsedBytes.load();
-        while (c>p) {
-            if (stats.peakUsedBytes.compare_exchange_weak(p,c)) break;
+        while(c>p){
+            if(stats.peakUsedBytes.compare_exchange_weak(p,c)) break;
         }
 
         return block + sizeof(SmallBlockHeader);
     }
 
-    // Freed small block => push to bin
     void freeSmall(void* userPtr, AllocStats& stats) {
-        if (!userPtr) return;
-        // recover the header
-        char* blockStart = (char*)userPtr - sizeof(SmallBlockHeader);
-        auto* sb = reinterpret_cast<SmallFreeBlock*>(blockStart);
-        int bin = sb->hdr.binIndex;
-        if (bin<0 || bin>=SMALL_BIN_COUNT) {
+        if(!userPtr) return;
+        char* blockStart=(char*)userPtr - sizeof(SmallBlockHeader);
+        auto* fb = reinterpret_cast<SmallFreeBlock*>(blockStart);
+        int bin = (int)fb->hdr.binIndex;
+        if(bin<0 || bin>=SMALL_BIN_COUNT) {
             // invalid
             return;
         }
-        size_t totalSize = sizeof(SmallBlockHeader) + SMALL_BIN_SIZE[bin];
+        size_t totalSz = sizeof(SmallBlockHeader)+SMALL_BIN_SIZE[bin];
         stats.totalFreeCalls.fetch_add(1);
-        stats.currentUsedBytes.fetch_sub(totalSize);
+        stats.currentUsedBytes.fetch_sub(totalSz);
 
-        sb->next = freeList_[bin];
-        freeList_[bin] = sb;
+        // push front
+        fb->next = freeList_[bin];
+        freeList_[bin] = fb;
     }
 
 private:
     SmallFreeBlock* freeList_[SMALL_BIN_COUNT];
 };
 
-//---------------------------------------------------
-// 3. Arena for large blocks
-//    We'll store a "BlockHeader" with totalSize, isFree
-//    plus a separate "userSize" so we know how big user wanted
-//---------------------------------------------------
+//-------------------------------------------------------
+// 3) Arena for large blocks
+//    immediate merges
+//-------------------------------------------------------
 class Arena {
 public:
     static constexpr uint32_t MAGIC = 0xCAFEBABE;
 
     struct BlockHeader {
         uint32_t magic;
-        size_t   totalSize; // including header+footer
-        size_t   userSize;  // how many bytes user requested
+        size_t   totalSize;
+        size_t   userSize; 
         bool     isFree;
     };
     struct BlockFooter {
@@ -159,202 +148,160 @@ public:
         size_t   totalSize;
         bool     isFree;
     };
-
     struct FreeBlock {
         BlockHeader hdr;
         FreeBlock* next;
     };
 
-    Arena(size_t arenaSize) : arenaSize_(arenaSize) {
+    Arena(size_t arenaSize)
+        : arenaSize_(arenaSize), usedBytes_(0)
+    {
         memory_ = (char*)::operator new(arenaSize_);
-        ::memset(memory_, 0, arenaSize_);
+        std::memset(memory_,0,arenaSize_);
 
-        // one big free block
         auto* fb = reinterpret_cast<FreeBlock*>(memory_);
-        fb->hdr.magic     = MAGIC;
-        fb->hdr.totalSize = arenaSize_;
-        fb->hdr.userSize  = 0;      // 0 => no user?
-        fb->hdr.isFree    = true;
-        fb->next = nullptr;
+        fb->hdr.magic=MAGIC;
+        fb->hdr.totalSize=arenaSize_;
+        fb->hdr.userSize=0;
+        fb->hdr.isFree=true;
+        fb->next=nullptr;
 
         auto* foot = getFooter(&fb->hdr);
-        foot->magic     = MAGIC;
-        foot->totalSize = arenaSize_;
-        foot->isFree    = true;
+        foot->magic=MAGIC;
+        foot->totalSize=arenaSize_;
+        foot->isFree=true;
 
-        firstFree_ = fb;
+        firstFree_=fb;
+    }
+    ~Arena(){
+        if(memory_){
+            ::operator delete(memory_);
+        }
     }
 
-    ~Arena() {
-        ::operator delete(memory_);
+    size_t usedBytes() const { return usedBytes_.load(); }
+    bool fullyFree() const { return usedBytes_.load()==0; }
+
+    void destroy() {
+        // unmap
+        if(memory_) {
+            ::operator delete(memory_);
+            memory_=nullptr;
+        }
     }
 
-    // We'll store the user pointer => blockStart + sizeof(BlockHeader)
-    // Then block->hdr.userSize = reqSize
-    // totalSize is overhead + user
     void* allocate(size_t reqSize, size_t alignment, AllocStats& stats) {
         std::lock_guard<std::mutex> lock(mtx_);
-
         stats.totalAllocCalls.fetch_add(1);
 
-        const size_t overhead = sizeof(BlockHeader) + sizeof(BlockFooter);
+        const size_t overhead=sizeof(BlockHeader)+sizeof(BlockFooter);
+        FreeBlock* prev=nullptr;
+        FreeBlock* cur=firstFree_;
 
-        FreeBlock* prev = nullptr;
-        FreeBlock* cur  = firstFree_;
+        while(cur){
+            if(cur->hdr.isFree && cur->hdr.totalSize>=(reqSize+overhead)){
+                // alignment
+                char* start=(char*)cur;
+                char* userArea=start+sizeof(BlockHeader);
+                size_t space=cur->hdr.totalSize - overhead;
+                void* alignedPtr=userArea;
+                if(std::align(alignment,reqSize,alignedPtr,space)){
+                    size_t padding=(char*)alignedPtr - userArea;
+                    size_t needed= overhead+padding+reqSize;
+                    if(cur->hdr.totalSize>=needed){
+                        if(!prev) firstFree_=cur->next;
+                        else prev->next=cur->next;
 
-        while (cur) {
-            if (cur->hdr.isFree && cur->hdr.totalSize >= (reqSize + overhead)) {
-                // attempt alignment
-                char* blockStart = reinterpret_cast<char*>(cur);
-                char* userArea   = blockStart + sizeof(BlockHeader);
-                size_t space     = cur->hdr.totalSize - overhead;
-                void* alignedPtr = userArea;
+                        size_t leftover=cur->hdr.totalSize-needed;
+                        bool canSplit= leftover>= (sizeof(FreeBlock)+overhead);
+                        if(canSplit){
+                            char* leftoverAddr= start+needed;
+                            auto* leftoverFB= (FreeBlock*) leftoverAddr;
+                            leftoverFB->hdr.magic= MAGIC;
+                            leftoverFB->hdr.totalSize= leftover;
+                            leftoverFB->hdr.userSize=0;
+                            leftoverFB->hdr.isFree=true;
+                            leftoverFB->next= firstFree_;
+                            firstFree_= leftoverFB;
 
-                if (std::align(alignment, reqSize, alignedPtr, space)) {
-                    size_t padding = (char*)alignedPtr - userArea;
-                    size_t needed  = overhead + padding + reqSize;
-
-                    if (cur->hdr.totalSize >= needed) {
-                        // split or use entire
-                        size_t leftover = cur->hdr.totalSize - needed;
-                        bool canSplit   = leftover >= (sizeof(FreeBlock)+ overhead);
-                        // remove from free list
-                        if (!prev) firstFree_ = cur->next;
-                        else       prev->next = cur->next;
-
-                        if (canSplit) {
-                            // create leftover
-                            char* leftoverAddr = blockStart + needed;
-                            auto* leftoverFB = reinterpret_cast<FreeBlock*>(leftoverAddr);
-                            leftoverFB->hdr.magic     = MAGIC;
-                            leftoverFB->hdr.totalSize = leftover;
-                            leftoverFB->hdr.userSize  = 0;
-                            leftoverFB->hdr.isFree    = true;
-                            leftoverFB->next = firstFree_;
-                            firstFree_ = leftoverFB;
-
-                            auto* leftoverFoot = getFooter(&leftoverFB->hdr);
-                            leftoverFoot->magic     = MAGIC;
-                            leftoverFoot->totalSize = leftover;
-                            leftoverFoot->isFree    = true;
-
-                            needed = needed; 
+                            auto* leftoverFoot=getFooter(&leftoverFB->hdr);
+                            leftoverFoot->magic= MAGIC;
+                            leftoverFoot->totalSize= leftover;
+                            leftoverFoot->isFree=true;
                         } else {
-                            needed = cur->hdr.totalSize;
+                            needed=cur->hdr.totalSize;
                         }
+                        // mark allocated
+                        cur->hdr.isFree=false;
+                        cur->hdr.userSize=reqSize;
+                        cur->hdr.totalSize=needed;
 
-                        // now mark cur allocated
-                        cur->hdr.isFree    = false;
-                        cur->hdr.userSize  = reqSize;
-                        cur->hdr.totalSize = needed;
+                        auto* foot=getFooter(&cur->hdr);
+                        foot->magic= MAGIC;
+                        foot->totalSize= needed;
+                        foot->isFree=false;
 
-                        auto* foot = getFooter(&cur->hdr);
-                        foot->magic     = MAGIC;
-                        foot->totalSize = needed;
-                        foot->isFree    = false;
-
+                        usedBytes_.fetch_add(needed);
                         stats.currentUsedBytes.fetch_add(needed);
-                        auto c = stats.currentUsedBytes.load();
-                        auto p = stats.peakUsedBytes.load();
-                        while (c>p) {
-                            if (stats.peakUsedBytes.compare_exchange_weak(p,c)) break;
+                        auto c=stats.currentUsedBytes.load();
+                        auto p=stats.peakUsedBytes.load();
+                        while(c>p){
+                            if(stats.peakUsedBytes.compare_exchange_weak(p,c)) break;
                         }
 
-                        // return user pointer
-                        return blockStart + sizeof(BlockHeader) + padding;
+                        return start+sizeof(BlockHeader)+padding;
                     }
                 }
             }
-            prev = cur;
-            cur  = cur->next;
+            prev=cur;
+            cur=cur->next;
         }
         return nullptr; // fail
     }
 
-    void deallocate(void* userPtr, AllocStats& stats) {
-        if (!userPtr) return;
+    void deallocate(void* userPtr, AllocStats& stats){
+        if(!userPtr) return;
         std::lock_guard<std::mutex> lock(mtx_);
 
-        // recover block
-        char* blockStart = (char*)userPtr - sizeof(BlockHeader);
-        auto* hdr = reinterpret_cast<BlockHeader*>(blockStart);
-        if (hdr->magic != MAGIC || !hdr->isFree == false) {
-            return; // invalid
-        }
-        hdr->isFree = true;
-
         stats.totalFreeCalls.fetch_add(1);
-        stats.currentUsedBytes.fetch_sub(hdr->totalSize);
 
-        // re-insert into free list
-        auto* fb = reinterpret_cast<FreeBlock*>(hdr);
-        fb->next = firstFree_;
-        firstFree_ = fb;
+        char* start=(char*)userPtr - sizeof(BlockHeader);
+        auto* hdr=(BlockHeader*)start;
+        if(hdr->magic!=MAGIC || !hdr->isFree==false){
+            return;
+        }
+        hdr->isFree=true;
 
-        // immediate coalescing
+        size_t sz=hdr->totalSize;
+        usedBytes_.fetch_sub(sz);
+        stats.currentUsedBytes.fetch_sub(sz);
+
+        // insert in free list
+        auto* fb=(FreeBlock*)hdr;
+        fb->next= firstFree_;
+        firstFree_= fb;
+
+        // merges
         coalesceForward(fb);
         coalesceBackward(fb);
     }
 
+    void coalesceAll(){
+        std::lock_guard<std::mutex> lock(mtx_);
+        // we do merges on free anyway
+    }
+
 private:
-    // get footer
-    BlockFooter* getFooter(BlockHeader* hdr) {
-        char* footAddr = reinterpret_cast<char*>(hdr) + hdr->totalSize - sizeof(BlockFooter);
-        return reinterpret_cast<BlockFooter*>(footAddr);
+    BlockFooter* getFooter(BlockHeader* hdr){
+        char* footAddr=(char*)hdr + hdr->totalSize - sizeof(BlockFooter);
+        return (BlockFooter*)footAddr;
     }
-
-    // coalesce forward
-    void coalesceForward(FreeBlock* blk) {
-        // next block is at (char*)blk + blk->hdr.totalSize
-        char* nextAddr = (char*)blk + blk->hdr.totalSize;
-        if (nextAddr >= (memory_ + arenaSize_)) return;
-        auto* nxtHdr = reinterpret_cast<BlockHeader*>(nextAddr);
-        if (nxtHdr->magic == MAGIC && nxtHdr->isFree) {
-            // remove from free list
-            removeFreeBlock(nxtHdr);
-            // unify
-            blk->hdr.totalSize += nxtHdr->totalSize;
-            auto* foot = getFooter(&blk->hdr);
-            foot->magic     = MAGIC;
-            foot->totalSize = blk->hdr.totalSize;
-            foot->isFree    = true;
-        }
-    }
-
-    // coalesce backward
-    void coalesceBackward(FreeBlock* blk) {
-        // check if there's a block behind us
-        if ((char*)blk == memory_) return; // no prior
-        // the footer of the prev block is right before (char*)blk
-        char* footAddr = (char*)blk - sizeof(BlockFooter);
-        if (footAddr < memory_) return;
-        auto* foot = reinterpret_cast<BlockFooter*>(footAddr);
-        if (foot->magic == MAGIC && foot->isFree) {
-            // the prev block is free
-            size_t prevSize = foot->totalSize;
-            char* prevHdrAddr = (char*)blk - prevSize;
-            auto* prevHdr = reinterpret_cast<BlockHeader*>(prevHdrAddr);
-            if (prevHdr->magic == MAGIC && prevHdr->isFree) {
-                // remove 'blk' from free list
-                removeFreeBlock(&blk->hdr);
-
-                // unify
-                prevHdr->totalSize += blk->hdr.totalSize;
-                auto* newFoot = getFooter(prevHdr);
-                newFoot->magic     = MAGIC;
-                newFoot->totalSize = prevHdr->totalSize;
-                newFoot->isFree    = true;
-            }
-        }
-    }
-
-    // remove a block from free list
-    void removeFreeBlock(BlockHeader* h) {
+    void removeFreeBlock(BlockHeader* h){
         FreeBlock* prev=nullptr;
         FreeBlock* cur=firstFree_;
-        while (cur) {
-            if (&cur->hdr == h) {
-                if (!prev) firstFree_=cur->next;
+        while(cur){
+            if(&cur->hdr==h){
+                if(!prev) firstFree_=cur->next;
                 else prev->next=cur->next;
                 cur->next=nullptr;
                 return;
@@ -363,78 +310,164 @@ private:
             cur=cur->next;
         }
     }
+    void coalesceForward(FreeBlock* blk){
+        char* nxtAddr=(char*)blk + blk->hdr.totalSize;
+        if(nxtAddr>=memory_+arenaSize_) return;
+        auto* nxtHdr=(BlockHeader*)nxtAddr;
+        if(nxtHdr->magic==MAGIC && nxtHdr->isFree){
+            removeFreeBlock(nxtHdr);
+            blk->hdr.totalSize+= nxtHdr->totalSize;
+            auto* foot=getFooter(&blk->hdr);
+            foot->magic= MAGIC;
+            foot->totalSize= blk->hdr.totalSize;
+            foot->isFree= true;
+        }
+    }
+    void coalesceBackward(FreeBlock* blk){
+        if((char*)blk== memory_) return;
+        char* footAddr=(char*)blk - sizeof(BlockFooter);
+        if(footAddr<memory_) return;
+        auto* foot=(BlockFooter*)footAddr;
+        if(foot->magic==MAGIC && foot->isFree){
+            size_t prevSz= foot->totalSize;
+            char* prevAddr=(char*)blk - prevSz;
+            auto* prevHdr=(BlockHeader*)prevAddr;
+            if(prevHdr->magic==MAGIC && prevHdr->isFree){
+                removeFreeBlock(&blk->hdr);
+                removeFreeBlock(prevHdr);
+                prevHdr->totalSize+= blk->hdr.totalSize;
+                auto* newFoot=getFooter(prevHdr);
+                newFoot->magic= MAGIC;
+                newFoot->totalSize= prevHdr->totalSize;
+                newFoot->isFree= true;
 
-private:
+                auto* fb=(FreeBlock*)prevHdr;
+                fb->next= firstFree_;
+                firstFree_= fb;
+            }
+        }
+    }
+
     char* memory_;
     size_t arenaSize_;
+    std::atomic<size_t> usedBytes_;
     FreeBlock* firstFree_;
     std::mutex mtx_;
 };
 
-//---------------------------------------------------
-// 4. The thread data
-//---------------------------------------------------
+//-------------------------------------------------------
+// 4) ThreadLocalData
+//-------------------------------------------------------
 struct ThreadLocalData {
     Arena* arena;
     ThreadLocalSmallCache smallCache;
 };
 
-//---------------------------------------------------
-// 5. The fancy per-thread facade
-//---------------------------------------------------
-class FancyPerThreadAllocator {
+//-------------------------------------------------------
+// 5) GlobalArenaManager with optional reclamation
+//-------------------------------------------------------
+class GlobalArenaManager {
 public:
-    explicit FancyPerThreadAllocator(size_t defaultArenaSize)
-        : defaultArenaSize_(defaultArenaSize)
+    GlobalArenaManager(bool enableReclamation)
+        : stopThread_(false)
+        , enableReclamation_(enableReclamation)
     {
-        // create one global arena for demonstration
-        globalArena_ = new Arena(defaultArenaSize_);
+        if(enableReclamation_){
+            bgThread_ = std::thread([this]{ this->bgLoop(); });
+        }
+    }
+    ~GlobalArenaManager(){
+        {
+            std::lock_guard<std::mutex> lk(mgrMutex_);
+            stopThread_ = true;
+        }
+        cv_.notify_all();
+        if(bgThread_.joinable()){
+            bgThread_.join();
+        }
+        // clean up all arenas
+        for(auto* a: arenas_){
+            a->destroy();
+            delete a;
+        }
     }
 
-    ~FancyPerThreadAllocator() {
-        delete globalArena_;
+    Arena* createArena(size_t arenaSize){
+        std::lock_guard<std::mutex> lk(mgrMutex_);
+        auto* a=new Arena(arenaSize);
+        arenas_.push_back(a);
+        return a;
+    }
+
+private:
+    void bgLoop(){
+        // runs every 1 second
+        while(true){
+            std::unique_lock<std::mutex> lk(mgrMutex_);
+            cv_.wait_for(lk, std::chrono::seconds(1), [this]{return stopThread_;});
+            if(stopThread_) break;
+            if(!enableReclamation_) continue; 
+
+            // pass
+            for(size_t i=0; i<arenas_.size(); ){
+                auto* ar= arenas_[i];
+                ar->coalesceAll();
+                if(ar->fullyFree()){
+                    // reclaim
+                    ar->destroy();
+                    delete ar;
+                    arenas_.erase(arenas_.begin()+i);
+                } else {
+                    i++;
+                }
+            }
+        }
+    }
+
+    std::vector<Arena*> arenas_;
+    bool stopThread_;
+    bool enableReclamation_;
+    std::thread bgThread_;
+    std::mutex mgrMutex_;
+    std::condition_variable cv_;
+};
+
+//-------------------------------------------------------
+// 6) The main facade
+//-------------------------------------------------------
+class FancyPerThreadAllocator {
+public:
+    explicit FancyPerThreadAllocator(size_t defaultArenaSize, bool enableReclamation=false)
+        : defaultArenaSize_(defaultArenaSize)
+    {
+        manager_ = std::make_shared<GlobalArenaManager>(enableReclamation);
     }
 
     AllocStatsSnapshot getStatsSnapshot() const {
         return stats_.snapshot();
     }
 
-    // unified allocate
     void* allocate(size_t size) {
-        if (size==0) size=1;
-
-        // check thread local data
+        if(size==0) size=1;
         auto* tld = getThreadData();
-
-        // attempt small block
-        if (size <= 256) {
-            void* p = tld->smallCache.allocateSmall(size, stats_);
-            if (p) return p;
+        // small path
+        if(size <= 256){
+            return tld->smallCache.allocateSmall(size, stats_);
         }
-        // else large block
+        // else large
         return tld->arena->allocate(size, alignof(std::max_align_t), stats_);
     }
 
-    // unified free
-    void deallocate(void* userPtr) {
-        if (!userPtr) return;
-        // first read the size we stored
-        // if it's a small block, we have a small header
-        // if it's a large block, we have the arena's boundary
-
-        // We do a tiny metadata approach: check the magic
-        // We'll read a 32-bit magic from userPtr - 4 bytes. 
-        // This is a quick hack to see if it's small or large
-        char* p = (char*)userPtr - 4; 
+    void deallocate(void* ptr) {
+        if(!ptr) return;
+        // read the last 4 bytes to see if magic
+        char* p = (char*)ptr - 4;
         uint32_t mg = *(uint32_t*)p;
-
-        auto* tld = getThreadData();
-        if (mg == Arena::MAGIC) {
-            // large block
-            tld->arena->deallocate(userPtr, stats_);
+        auto* tld=getThreadData();
+        if(mg==Arena::MAGIC){
+            tld->arena->deallocate(ptr, stats_);
         } else {
-            // small block approach
-            tld->smallCache.freeSmall(userPtr, stats_);
+            tld->smallCache.freeSmall(ptr, stats_);
         }
     }
 
@@ -442,20 +475,18 @@ private:
     static thread_local ThreadLocalData* tld_;
 
     ThreadLocalData* getThreadData() {
-        if (!tld_) {
-            // create an arena for each thread
-            auto* a = new Arena(defaultArenaSize_);
+        if(!tld_){
+            Arena* a = manager_->createArena(defaultArenaSize_);
             tld_ = new ThreadLocalData{a, ThreadLocalSmallCache()};
         }
         return tld_;
     }
 
     size_t defaultArenaSize_;
-    Arena* globalArena_; // example (not used heavily)
-
+    std::shared_ptr<GlobalArenaManager> manager_;
     mutable AllocStats stats_;
 };
 
 thread_local ThreadLocalData* FancyPerThreadAllocator::tld_ = nullptr;
 
-#endif // ARENA_ALLOCATOR_H
+#endif // MEMORY_ALLOCATOR_H
