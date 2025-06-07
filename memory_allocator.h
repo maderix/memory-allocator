@@ -267,10 +267,16 @@ public:
 
         char* start=(char*)userPtr - sizeof(BlockHeader);
         auto* hdr=(BlockHeader*)start;
-        if(hdr->magic!=MAGIC || !hdr->isFree==false){
+        if(hdr->magic!=MAGIC || hdr->isFree){
             return;
         }
         hdr->isFree=true;
+
+        // update footer to reflect freed block
+        auto* foot = getFooter(hdr);
+        foot->magic = MAGIC;
+        foot->totalSize = hdr->totalSize;
+        foot->isFree = true;
 
         size_t sz=hdr->totalSize;
         usedBytes_.fetch_sub(sz);
