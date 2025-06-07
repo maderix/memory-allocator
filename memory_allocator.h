@@ -466,11 +466,11 @@ public:
 
     void deallocate(void* ptr) {
         if(!ptr) return;
-        // read the last 4 bytes to see if magic
-        char* p = (char*)ptr - 4;
-        uint32_t mg = *(uint32_t*)p;
+        // look at the arena block header preceding the pointer
+        char* headerStart = (char*)ptr - sizeof(Arena::BlockHeader);
+        auto* hdr = reinterpret_cast<Arena::BlockHeader*>(headerStart);
         auto* tld=getThreadData();
-        if(mg==Arena::MAGIC){
+        if(hdr->magic==Arena::MAGIC){
             tld->arena->deallocate(ptr, stats_);
         } else {
             tld->smallCache.freeSmall(ptr, stats_);
