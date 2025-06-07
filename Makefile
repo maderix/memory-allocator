@@ -8,7 +8,10 @@ SRCS = main.cpp
 HEADERS = memory_allocator.h
 BUILD_DIR = build
 
-.PHONY: all clean debug release
+TEST_TARGET = allocator_basic_test
+TEST_SRCS = tests/allocator_basic_test.cpp
+
+.PHONY: all clean debug release test
 
 all: release
 
@@ -22,6 +25,11 @@ release: $(BUILD_DIR)
 debug: CXXFLAGS += $(DEBUG_FLAGS)
 debug: $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $(BUILD_DIR)/$(TARGET)_debug
+
+test: CXXFLAGS += $(DEBUG_FLAGS)
+test: $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I. $(TEST_SRCS) -o $(BUILD_DIR)/$(TEST_TARGET)
+	$(BUILD_DIR)/$(TEST_TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR)
