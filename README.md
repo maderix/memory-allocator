@@ -65,10 +65,10 @@ A sample Makefile is provided. To compile:
 
 ```bash
 make
-./memory_allocator_test
+./build/memory_allocator_test
 
 example output:
-./build/memory_allocator_test 
+./build/memory_allocator_test
 
 === Compare System Malloc vs. Fancy(Off) vs. Fancy(On) under HPC ephemeral scenario ===
 Threads= 512, Ops/Thread= 1000000, ringSize= 500000
@@ -85,3 +85,4 @@ Elapsed (us): 41289834
 Alloc calls : 352295903, Free calls: 216814382, Peak usage: 36793754057
 
 All tests completed.
+```
