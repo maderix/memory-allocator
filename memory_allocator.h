@@ -267,7 +267,7 @@ public:
 
         char* start=(char*)userPtr - sizeof(BlockHeader);
         auto* hdr=(BlockHeader*)start;
-        if(hdr->magic!=MAGIC || !hdr->isFree==false){
+        if(hdr->magic!=MAGIC || hdr->isFree){
             return;
         }
         hdr->isFree=true;
